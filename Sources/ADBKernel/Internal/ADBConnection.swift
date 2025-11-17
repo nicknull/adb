@@ -6,29 +6,76 @@ final class ADBConnection {
         case authenticationRequired
         case invalidPacket
         case channelClosed
+        case sslUnavailable
     }
 
     private let configuration: ADBKernel.Configuration
-    private let socket: TCPSocket
+    private let socket: SocketConnection
     private var nextLocalID: UInt32 = 1
     private var maxPayload: UInt32 = 256 * 1024
     private var remoteMaxPayload: UInt32 = 4096
+    private var pendingPackets: [UInt32: [ADBPacket]] = [:]
+    private let sendLock = NSLock()
+    private let receiveLock = NSLock()
+    private(set) var isClosed = false
 
     init(configuration: ADBKernel.Configuration) throws {
         self.configuration = configuration
-        self.socket = try TCPSocket(host: configuration.host, port: configuration.port)
+        switch configuration.transportSecurity {
+        case .plaintext:
+            self.socket = try TCPSocket(host: configuration.host, port: configuration.port, options: configuration.socketOptions)
+#if canImport(Network)
+        case .tls(let tlsConfiguration):
+            self.socket = try TLSSocket(host: configuration.host, port: configuration.port, configuration: tlsConfiguration)
+#else
+        case .tls(_):
+            throw ConnectionError.sslUnavailable
+#endif
+        }
         try performHandshake()
     }
 
     func close() {
         socket.close()
+        isClosed = true
     }
 
     func performShell(_ command: String) throws -> Data {
-        let service = "shell:\(command)\0"
+        let service = "shell:\(command)"
         let channel = try openChannel(named: service)
         defer { try? close(channel: channel) }
         return try drain(channel: channel)
+    }
+
+    func openStream(service: String) throws -> ADBChannel {
+        try openChannel(named: service)
+    }
+
+    func write(_ data: Data, to channel: ADBChannel) throws {
+        guard channel.isOpen else { throw ConnectionError.channelClosed }
+        try send(packet: ADBPacket(command: ADBCommand.write, arg0: channel.localID, arg1: channel.remoteID, data: data))
+        let response = try nextPacket(for: channel)
+        guard response.command == ADBCommand.okay else {
+            throw ConnectionError.invalidPacket
+        }
+    }
+
+    func readChunk(from channel: ADBChannel) throws -> Data? {
+        guard channel.isOpen else { return nil }
+        while true {
+            let packet = try nextPacket(for: channel)
+            switch packet.command {
+            case ADBCommand.write:
+                try send(packet: ADBPacket(command: ADBCommand.okay, arg0: channel.localID, arg1: channel.remoteID))
+                return packet.data
+            case ADBCommand.close:
+                channel.markClosed()
+                try send(packet: ADBPacket(command: ADBCommand.close, arg0: channel.localID, arg1: channel.remoteID))
+                return nil
+            default:
+                continue
+            }
+        }
     }
 
     private func performHandshake() throws {
@@ -68,10 +115,14 @@ final class ADBConnection {
         }
     }
 
-    private func openChannel(named name: String) throws -> Channel {
+    private func openChannel(named name: String) throws -> ADBChannel {
+        var serviceName = name
+        if !serviceName.hasSuffix("\0") {
+            serviceName.append("\0")
+        }
         let localID = nextLocalID
         nextLocalID += 1
-        guard let data = name.data(using: .utf8) else {
+        guard let data = serviceName.data(using: .utf8) else {
             throw ConnectionError.invalidPacket
         }
         try send(packet: ADBPacket(command: ADBCommand.open, arg0: localID, arg1: 0, data: data))
@@ -79,7 +130,7 @@ final class ADBConnection {
             let packet = try readPacket()
             switch packet.command {
             case ADBCommand.okay where packet.arg1 == localID:
-                return Channel(localID: localID, remoteID: packet.arg0)
+                return ADBChannel(localID: localID, remoteID: packet.arg0)
             case ADBCommand.close where packet.arg1 == localID:
                 throw ConnectionError.channelClosed
             default:
@@ -88,32 +139,35 @@ final class ADBConnection {
         }
     }
 
-    private func close(channel: Channel) throws {
+    func close(channel: ADBChannel) throws {
+        guard channel.isOpen else { return }
+        channel.markClosed()
         try send(packet: ADBPacket(command: ADBCommand.close, arg0: channel.localID, arg1: channel.remoteID))
     }
 
-    private func drain(channel: Channel) throws -> Data {
+    private func drain(channel: ADBChannel) throws -> Data {
         var buffer = Data()
         while true {
-            let packet = try readPacket()
-            switch packet.command {
-            case ADBCommand.write where packet.arg0 == channel.remoteID:
-                buffer.append(packet.data)
-                try send(packet: ADBPacket(command: ADBCommand.okay, arg0: channel.localID, arg1: channel.remoteID))
-            case ADBCommand.close where packet.arg0 == channel.remoteID:
-                try send(packet: ADBPacket(command: ADBCommand.close, arg0: channel.localID, arg1: channel.remoteID))
+            guard let chunk = try readChunk(from: channel) else {
                 return buffer
-            default:
-                continue
             }
+            buffer.append(chunk)
         }
     }
 
     private func send(packet: ADBPacket) throws {
+        sendLock.lock()
+        defer { sendLock.unlock() }
         try socket.send(packet.serialize())
     }
 
     private func readPacket() throws -> ADBPacket {
+        receiveLock.lock()
+        defer { receiveLock.unlock() }
+        return try readPacketUnlocked()
+    }
+
+    private func readPacketUnlocked() throws -> ADBPacket {
         let header = try socket.receive(length: 24)
         let command = header.withUnsafeBytes { $0.load(as: UInt32.self) }
         let arg0 = header.withUnsafeBytes { $0.load(fromByteOffset: 4, as: UInt32.self) }
@@ -134,9 +188,36 @@ final class ADBConnection {
 
         return ADBPacket(command: command, arg0: arg0, arg1: arg1, data: payload)
     }
+
+    private func nextPacket(for channel: ADBChannel) throws -> ADBPacket {
+        receiveLock.lock()
+        defer { receiveLock.unlock() }
+        if var queued = pendingPackets[channel.localID], !queued.isEmpty {
+            let packet = queued.removeFirst()
+            pendingPackets[channel.localID] = queued.isEmpty ? nil : queued
+            return packet
+        }
+        while true {
+            let packet = try readPacketUnlocked()
+            if packet.arg1 == channel.localID {
+                return packet
+            }
+            pendingPackets[packet.arg1, default: []].append(packet)
+        }
+    }
 }
 
-private struct Channel {
+final class ADBChannel {
     let localID: UInt32
     let remoteID: UInt32
+    private(set) var isOpen = true
+
+    init(localID: UInt32, remoteID: UInt32) {
+        self.localID = localID
+        self.remoteID = remoteID
+    }
+
+    func markClosed() {
+        isOpen = false
+    }
 }

@@ -21,6 +21,7 @@ final class MockADBServer {
     private let stateQueue = DispatchQueue(label: "mock.adb.state")
     private var recordedServices: [String] = []
     private var recordedAuthTypes: [UInt32] = []
+    private var totalConnections: Int = 0
 
     init(authenticationMode: AuthenticationMode = .none, responseProvider: @escaping (String) -> Data) {
         self.authenticationMode = authenticationMode
@@ -97,6 +98,10 @@ final class MockADBServer {
         stateQueue.sync { recordedAuthTypes }
     }
 
+    func connectionsAccepted() -> Int {
+        stateQueue.sync { totalConnections }
+    }
+
     private func record(service: String) {
         stateQueue.sync {
             recordedServices.append(service)
@@ -121,6 +126,7 @@ final class MockADBServer {
             if clientFD < 0 {
                 continue
             }
+            stateQueue.sync { totalConnections += 1 }
             handleClient(fd: clientFD)
 #if canImport(Darwin)
             Darwin.close(clientFD)
@@ -149,13 +155,37 @@ final class MockADBServer {
                 nextRemoteID += 1
                 let okay = ADBPacket(command: ADBCommand.okay, arg0: remoteID, arg1: packet.arg0)
                 try? send(packet: okay, fd: fd)
-                let payload = responseProvider(serviceName)
-                let write = ADBPacket(command: ADBCommand.write, arg0: remoteID, arg1: packet.arg0, data: payload)
-                try? send(packet: write, fd: fd)
-                _ = try? readPacket(fd: fd) // host OKAY
-                let close = ADBPacket(command: ADBCommand.close, arg0: remoteID, arg1: packet.arg0)
+                if serviceName.hasPrefix("tcp:") {
+                    handleTCPStream(fd: fd, hostLocalID: packet.arg0, remoteID: remoteID)
+                } else {
+                    let payload = responseProvider(serviceName)
+                    let write = ADBPacket(command: ADBCommand.write, arg0: remoteID, arg1: packet.arg0, data: payload)
+                    try? send(packet: write, fd: fd)
+                    _ = try? readPacket(fd: fd) // host OKAY
+                    let close = ADBPacket(command: ADBCommand.close, arg0: remoteID, arg1: packet.arg0)
+                    try? send(packet: close, fd: fd)
+                    _ = try? readPacket(fd: fd) // host close ack
+                }
+            default:
+                continue
+            }
+        }
+    }
+
+    private func handleTCPStream(fd: Int32, hostLocalID: UInt32, remoteID: UInt32) {
+        while running {
+            guard let packet = try? readPacket(fd: fd) else { break }
+            switch packet.command {
+            case ADBCommand.write where packet.arg0 == hostLocalID:
+                let okay = ADBPacket(command: ADBCommand.okay, arg0: remoteID, arg1: hostLocalID)
+                try? send(packet: okay, fd: fd)
+                let echo = ADBPacket(command: ADBCommand.write, arg0: remoteID, arg1: hostLocalID, data: packet.data)
+                try? send(packet: echo, fd: fd)
+            case ADBCommand.close where packet.arg0 == hostLocalID:
+                let close = ADBPacket(command: ADBCommand.close, arg0: remoteID, arg1: hostLocalID)
                 try? send(packet: close, fd: fd)
-                _ = try? readPacket(fd: fd) // host close ack
+                _ = try? readPacket(fd: fd)
+                return
             default:
                 continue
             }

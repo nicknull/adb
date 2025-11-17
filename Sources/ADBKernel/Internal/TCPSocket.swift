@@ -5,16 +5,10 @@ import Darwin
 import Glibc
 #endif
 
-final class TCPSocket {
-    enum SocketError: Error {
-        case connectionFailed(String)
-        case sendFailed
-        case receiveFailed
-    }
-
+final class TCPSocket: SocketConnection {
     private let fileDescriptor: Int32
 
-    init(host: String, port: UInt16) throws {
+    init(host: String, port: UInt16, options: ADBKernel.SocketOptions) throws {
         #if canImport(Darwin)
         typealias SocketAddr = sockaddr
         #endif
@@ -52,6 +46,19 @@ final class TCPSocket {
             if fd == -1 {
                 pointer = pointer.pointee.ai_next
                 continue
+            }
+
+            if options.reuseAddress {
+                var value: Int32 = 1
+                setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &value, socklen_t(MemoryLayout<Int32>.size))
+            }
+            if options.reusePort {
+                var value: Int32 = 1
+#if canImport(Darwin)
+                setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &value, socklen_t(MemoryLayout<Int32>.size))
+#else
+                setsockopt(fd, SOL_SOCKET, Int32(SO_REUSEPORT), &value, socklen_t(MemoryLayout<Int32>.size))
+#endif
             }
 
             let result: Int32 = address.withMemoryRebound(to: sockaddr.self, capacity: 1) {
