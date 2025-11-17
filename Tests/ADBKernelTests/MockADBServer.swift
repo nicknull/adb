@@ -13,6 +13,12 @@ final class MockADBServer {
         case signatureThenPublicKey
     }
 
+    private struct SyncFile {
+        var data: Data
+        var mode: UInt32
+        var mtime: UInt32
+    }
+
     private var listenFD: Int32 = -1
     private var thread: Thread?
     private var running = false
@@ -22,6 +28,7 @@ final class MockADBServer {
     private var recordedServices: [String] = []
     private var recordedAuthTypes: [UInt32] = []
     private var totalConnections: Int = 0
+    private var syncFiles: [String: SyncFile] = [:]
 
     init(authenticationMode: AuthenticationMode = .none, responseProvider: @escaping (String) -> Data) {
         self.authenticationMode = authenticationMode
@@ -102,6 +109,19 @@ final class MockADBServer {
         stateQueue.sync { totalConnections }
     }
 
+    func seedSyncFile(path: String, contents: Data, mode: UInt32 = 0o644, mtime: UInt32 = 0) {
+        stateQueue.sync {
+            syncFiles[path] = SyncFile(data: contents, mode: mode, mtime: mtime)
+        }
+    }
+
+    func syncFile(at path: String) -> (data: Data, mode: UInt32, mtime: UInt32)? {
+        stateQueue.sync {
+            guard let file = syncFiles[path] else { return nil }
+            return (file.data, file.mode, file.mtime)
+        }
+    }
+
     private func record(service: String) {
         stateQueue.sync {
             recordedServices.append(service)
@@ -157,6 +177,8 @@ final class MockADBServer {
                 try? send(packet: okay, fd: fd)
                 if serviceName.hasPrefix("tcp:") {
                     handleTCPStream(fd: fd, hostLocalID: packet.arg0, remoteID: remoteID)
+                } else if serviceName == "sync:" {
+                    handleSyncService(fd: fd, hostLocalID: packet.arg0, remoteID: remoteID)
                 } else {
                     let payload = responseProvider(serviceName)
                     let write = ADBPacket(command: ADBCommand.write, arg0: remoteID, arg1: packet.arg0, data: payload)
@@ -190,6 +212,129 @@ final class MockADBServer {
                 continue
             }
         }
+    }
+
+    private func handleSyncService(fd: Int32, hostLocalID: UInt32, remoteID: UInt32) {
+        var buffer = Data()
+        var pendingSend: (path: String, mode: UInt32, data: Data)?
+        while running {
+            guard let packet = try? readPacket(fd: fd) else { break }
+            switch packet.command {
+            case ADBCommand.write where packet.arg0 == hostLocalID:
+                let okay = ADBPacket(command: ADBCommand.okay, arg0: remoteID, arg1: hostLocalID)
+                try? send(packet: okay, fd: fd)
+                buffer.append(packet.data)
+                while true {
+                    guard let frame = popSyncFrame(from: &buffer) else { break }
+                    processSyncFrame(frame, pendingSend: &pendingSend, fd: fd, hostLocalID: hostLocalID, remoteID: remoteID)
+                }
+            case ADBCommand.close where packet.arg0 == hostLocalID:
+                let close = ADBPacket(command: ADBCommand.close, arg0: remoteID, arg1: hostLocalID)
+                try? send(packet: close, fd: fd)
+                _ = try? readPacket(fd: fd)
+                return
+            default:
+                continue
+            }
+        }
+    }
+
+    private func popSyncFrame(from buffer: inout Data) -> (command: String, payload: Data)? {
+        guard buffer.count >= 8 else { return nil }
+        let commandData = buffer.prefix(4)
+        guard let command = String(data: commandData, encoding: .ascii) else { return nil }
+        let lengthData = buffer[4..<8]
+        let length = Int(lengthData.withUnsafeBytes { $0.load(as: UInt32.self) })
+        guard buffer.count >= 8 + length else { return nil }
+        let payloadStart = buffer.index(buffer.startIndex, offsetBy: 8)
+        let payloadEnd = buffer.index(payloadStart, offsetBy: length)
+        let payload = Data(buffer[payloadStart..<payloadEnd])
+        buffer.removeSubrange(buffer.startIndex..<payloadEnd)
+        return (command, payload)
+    }
+
+    private func processSyncFrame(
+        _ frame: (command: String, payload: Data),
+        pendingSend: inout (path: String, mode: UInt32, data: Data)?,
+        fd: Int32,
+        hostLocalID: UInt32,
+        remoteID: UInt32
+    ) {
+        switch frame.command {
+        case "RECV":
+            let path = String(data: frame.payload, encoding: .utf8) ?? ""
+            guard let file = syncFile(at: path) else {
+                sendSyncResponse(command: "FAIL", payload: Data("ENOENT".utf8), fd: fd, hostLocalID: hostLocalID, remoteID: remoteID)
+                return
+            }
+            let chunkSize = 1024
+            var offset = 0
+            while offset < file.data.count {
+                let end = min(file.data.count, offset + chunkSize)
+                let chunk = file.data.subdata(in: offset..<end)
+                sendSyncResponse(command: "DATA", payload: chunk, fd: fd, hostLocalID: hostLocalID, remoteID: remoteID)
+                offset = end
+            }
+            var zero: UInt32 = 0
+            let donePayload = Data(bytes: &zero, count: MemoryLayout<UInt32>.size)
+            sendSyncResponse(command: "DONE", payload: donePayload, fd: fd, hostLocalID: hostLocalID, remoteID: remoteID)
+        case "SEND":
+            let descriptor = String(data: frame.payload, encoding: .utf8) ?? ""
+            guard let comma = descriptor.lastIndex(of: ",") else {
+                sendSyncResponse(command: "FAIL", payload: Data("bad descriptor".utf8), fd: fd, hostLocalID: hostLocalID, remoteID: remoteID)
+                return
+            }
+            let path = String(descriptor[..<comma])
+            let modeString = String(descriptor[descriptor.index(after: comma)...])
+            let mode = UInt32(modeString, radix: 8) ?? 0o644
+            pendingSend = (path: path, mode: mode, data: Data())
+        case "DATA":
+            guard var pending = pendingSend else { return }
+            pending.data.append(frame.payload)
+            pendingSend = pending
+        case "DONE":
+            guard let pending = pendingSend else {
+                sendSyncResponse(command: "FAIL", payload: Data("no pending send".utf8), fd: fd, hostLocalID: hostLocalID, remoteID: remoteID)
+                return
+            }
+            let mtime = frame.payload.withUnsafeBytes { ptr -> UInt32 in
+                guard ptr.count >= MemoryLayout<UInt32>.size else { return 0 }
+                return ptr.load(as: UInt32.self)
+            }
+            stateQueue.sync {
+                syncFiles[pending.path] = SyncFile(data: pending.data, mode: pending.mode, mtime: mtime)
+            }
+            pendingSend = nil
+            sendSyncResponse(command: "OKAY", payload: Data(), fd: fd, hostLocalID: hostLocalID, remoteID: remoteID)
+        case "STAT":
+            let path = String(data: frame.payload, encoding: .utf8) ?? ""
+            if let file = syncFile(at: path) {
+                var payload = Data(count: 12)
+                payload.withUnsafeMutableBytes { raw in
+                    raw.storeBytes(of: file.mode, toByteOffset: 0, as: UInt32.self)
+                    raw.storeBytes(of: UInt32(file.data.count), toByteOffset: 4, as: UInt32.self)
+                    raw.storeBytes(of: file.mtime, toByteOffset: 8, as: UInt32.self)
+                }
+                sendSyncResponse(command: "STAT", payload: payload, fd: fd, hostLocalID: hostLocalID, remoteID: remoteID)
+            } else {
+                let zeroPayload = Data(count: 12)
+                sendSyncResponse(command: "STAT", payload: zeroPayload, fd: fd, hostLocalID: hostLocalID, remoteID: remoteID)
+            }
+        default:
+            break
+        }
+    }
+
+    private func sendSyncResponse(command: String, payload: Data, fd: Int32, hostLocalID: UInt32, remoteID: UInt32) {
+        guard let commandData = command.data(using: .ascii), commandData.count == 4 else { return }
+        var frame = Data()
+        frame.append(commandData)
+        var length = UInt32(payload.count).littleEndian
+        frame.append(Data(bytes: &length, count: MemoryLayout<UInt32>.size))
+        frame.append(payload)
+        let write = ADBPacket(command: ADBCommand.write, arg0: remoteID, arg1: hostLocalID, data: frame)
+        try? send(packet: write, fd: fd)
+        _ = try? readPacket(fd: fd)
     }
 
     private func completeAuthentication(fd: Int32, initialCNXN: ADBPacket) -> Bool {

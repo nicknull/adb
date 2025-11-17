@@ -96,4 +96,46 @@ final class ADBKernelTests: XCTestCase {
         XCTAssertEqual(echoed, payload)
         stream.close()
     }
+
+    func testPullFileUsesSyncService() throws {
+        let server = MockADBServer { _ in Data() }
+        let contents = Data("hello".utf8)
+        server.seedSyncFile(path: "/sdcard/hello.txt", contents: contents, mode: 0o600, mtime: 321)
+        let port = try server.start()
+        defer { server.stop() }
+
+        let kernel = ADBKernel(host: "127.0.0.1", port: port)
+        let pulled = try kernel.pullFile("/sdcard/hello.txt")
+        XCTAssertEqual(pulled, contents)
+    }
+
+    func testPushFilePersistsOnServer() throws {
+        let server = MockADBServer { _ in Data() }
+        let port = try server.start()
+        defer { server.stop() }
+
+        let kernel = ADBKernel(host: "127.0.0.1", port: port)
+        let payload = Data("payload".utf8)
+        let mtime = Date(timeIntervalSince1970: 77)
+        try kernel.pushFile(payload, to: "/sdcard/payload.txt", permissions: 0o700, modifiedTime: mtime)
+        let stored = server.syncFile(at: "/sdcard/payload.txt")
+        XCTAssertEqual(stored?.data, payload)
+        XCTAssertEqual(stored?.mode, 0o700)
+        XCTAssertEqual(stored?.mtime, UInt32(mtime.timeIntervalSince1970))
+    }
+
+    func testStatReturnsMetadata() throws {
+        let server = MockADBServer { _ in Data() }
+        let data = Data("stat".utf8)
+        let mtime: UInt32 = 1234
+        server.seedSyncFile(path: "/sdcard/file.bin", contents: data, mode: 0o640, mtime: mtime)
+        let port = try server.start()
+        defer { server.stop() }
+
+        let kernel = ADBKernel(host: "127.0.0.1", port: port)
+        let info = try kernel.stat("/sdcard/file.bin")
+        XCTAssertEqual(info.permissions, 0o640)
+        XCTAssertEqual(info.size, UInt32(data.count))
+        XCTAssertEqual(info.modifiedTime, Date(timeIntervalSince1970: TimeInterval(mtime)))
+    }
 }

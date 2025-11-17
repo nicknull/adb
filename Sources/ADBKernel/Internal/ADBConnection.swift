@@ -53,10 +53,18 @@ final class ADBConnection {
 
     func write(_ data: Data, to channel: ADBChannel) throws {
         guard channel.isOpen else { throw ConnectionError.channelClosed }
-        try send(packet: ADBPacket(command: ADBCommand.write, arg0: channel.localID, arg1: channel.remoteID, data: data))
-        let response = try nextPacket(for: channel)
-        guard response.command == ADBCommand.okay else {
-            throw ConnectionError.invalidPacket
+        var offset = 0
+        let maxChunk = max(1, Int(remoteMaxPayload))
+        while offset < data.count {
+            let remaining = data.count - offset
+            let chunkSize = min(remaining, maxChunk)
+            let chunk = data.subdata(in: offset..<(offset + chunkSize))
+            try send(packet: ADBPacket(command: ADBCommand.write, arg0: channel.localID, arg1: channel.remoteID, data: chunk))
+            let response = try nextPacket(for: channel)
+            guard response.command == ADBCommand.okay else {
+                throw ConnectionError.invalidPacket
+            }
+            offset += chunkSize
         }
     }
 
@@ -204,6 +212,10 @@ final class ADBConnection {
             }
             pendingPackets[packet.arg1, default: []].append(packet)
         }
+    }
+
+    var maximumPayloadSize: Int {
+        max(1, Int(remoteMaxPayload))
     }
 }
 

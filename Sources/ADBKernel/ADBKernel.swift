@@ -159,6 +159,41 @@ public final class ADBKernel {
         try pngData.write(to: destination)
     }
 
+    public struct FileInfo {
+        public let path: String
+        public let size: UInt32
+        public let permissions: UInt32
+        public let modifiedTime: Date
+    }
+
+    public func pullFile(_ remotePath: String) throws -> Data {
+        let syncClient = try makeSyncClient()
+        return try syncClient.pull(path: remotePath)
+    }
+
+    public func pullFile(_ remotePath: String, to destination: URL) throws {
+        let data = try pullFile(remotePath)
+        try data.write(to: destination)
+    }
+
+    public func pushFile(_ data: Data, to remotePath: String, permissions: UInt32 = 0o644, modifiedTime: Date = Date()) throws {
+        let syncClient = try makeSyncClient()
+        let timestamp = UInt32(modifiedTime.timeIntervalSince1970)
+        try syncClient.push(data: data, path: remotePath, permissions: permissions, modifiedTime: timestamp)
+    }
+
+    public func pushFile(from localURL: URL, to remotePath: String, permissions: UInt32 = 0o644, modifiedTime: Date = Date()) throws {
+        let data = try Data(contentsOf: localURL)
+        try pushFile(data, to: remotePath, permissions: permissions, modifiedTime: modifiedTime)
+    }
+
+    public func stat(_ remotePath: String) throws -> FileInfo {
+        let syncClient = try makeSyncClient()
+        let stat = try syncClient.stat(path: remotePath)
+        let modified = Date(timeIntervalSince1970: TimeInterval(stat.modifiedTime))
+        return FileInfo(path: remotePath, size: stat.size, permissions: stat.mode, modifiedTime: modified)
+    }
+
     private func performShell(_ command: String) throws -> Data {
         if activeConnection == nil {
             try connect()
@@ -181,5 +216,13 @@ public final class ADBKernel {
             return lease.connection
         }
         return directConnection
+    }
+
+    private func makeSyncClient() throws -> ADBSyncClient {
+        if activeConnection == nil {
+            try connect()
+        }
+        guard let connection = activeConnection else { throw KernelError.disconnected }
+        return ADBSyncClient(connection: connection)
     }
 }

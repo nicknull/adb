@@ -14,6 +14,7 @@ required.
 - Reuses sockets/ports (via `SO_REUSEADDR`/`SO_REUSEPORT`) and exposes a global connection pool
 - Lets you open persistent `tcp:<port>` tunnels for low-level protocols
 - Exposes convenience helpers for running shell commands, dispatching key events, and triggering `screencap`
+- Implements the `sync:` service so you can `push`, `pull`, and `stat` files the same way libraries such as [adbutils](https://github.com/openatx/adbutils) do
 
 ## Usage
 
@@ -87,6 +88,27 @@ if let response = try stream.receive() {
 }
 stream.close()
 ```
+
+## File Transfers (Sync)
+
+ADBKernel speaks the same `sync:` wire protocol that Google’s adb client and community projects such as `adbutils` expose. Use it
+to move binaries, copy logs, or inspect metadata without shell round-trips:
+
+```swift
+let kernel = ADBKernel(host: "192.168.1.120")
+
+let info = try kernel.stat("/sdcard/Download/video.mp4")
+print("Size: \(info.size) bytes, permissions: \(String(info.permissions, radix: 8))")
+
+let screenshot = try kernel.pullFile("/sdcard/Pictures/latest.png")
+try screenshot.write(to: destinationURL)
+
+let payload = try Data(contentsOf: localURL)
+try kernel.pushFile(payload, to: "/sdcard/Download/app.bin", permissions: 0o755)
+```
+
+Under the hood the kernel opens the `sync:` service, issues `SEND`/`RECV`/`STAT` frames, and automatically chunks them to match
+the payload size negotiated during the initial `CNXN` handshake so large transfers stream reliably.
 
 ## iOS Deployment Notes
 
