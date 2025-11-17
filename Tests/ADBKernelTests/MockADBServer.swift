@@ -7,14 +7,23 @@ import Glibc
 @testable import ADBKernel
 
 final class MockADBServer {
+    enum AuthenticationMode {
+        case none
+        case signatureOnly
+        case signatureThenPublicKey
+    }
+
     private var listenFD: Int32 = -1
     private var thread: Thread?
     private var running = false
     private let responseProvider: (String) -> Data
+    private let authenticationMode: AuthenticationMode
     private let stateQueue = DispatchQueue(label: "mock.adb.state")
     private var recordedServices: [String] = []
+    private var recordedAuthTypes: [UInt32] = []
 
-    init(responseProvider: @escaping (String) -> Data) {
+    init(authenticationMode: AuthenticationMode = .none, responseProvider: @escaping (String) -> Data) {
+        self.authenticationMode = authenticationMode
         self.responseProvider = responseProvider
     }
 
@@ -84,9 +93,19 @@ final class MockADBServer {
         stateQueue.sync { recordedServices.last }
     }
 
+    func observedAuthTypes() -> [UInt32] {
+        stateQueue.sync { recordedAuthTypes }
+    }
+
     private func record(service: String) {
         stateQueue.sync {
             recordedServices.append(service)
+        }
+    }
+
+    private func recordAuth(type: UInt32) {
+        stateQueue.sync {
+            recordedAuthTypes.append(type)
         }
     }
 
@@ -115,8 +134,9 @@ final class MockADBServer {
         guard let cnxn = try? readPacket(fd: fd), cnxn.command == ADBCommand.cnxn else {
             return
         }
-        let response = ADBPacket(command: ADBCommand.cnxn, arg0: cnxn.arg0, arg1: 4096, data: "device::\0".data(using: .utf8) ?? Data())
-        try? send(packet: response, fd: fd)
+        guard completeAuthentication(fd: fd, initialCNXN: cnxn) else {
+            return
+        }
 
         var nextRemoteID: UInt32 = 100
         while running {
@@ -139,6 +159,44 @@ final class MockADBServer {
             default:
                 continue
             }
+        }
+    }
+
+    private func completeAuthentication(fd: Int32, initialCNXN: ADBPacket) -> Bool {
+        switch authenticationMode {
+        case .none:
+            let response = ADBPacket(command: ADBCommand.cnxn, arg0: initialCNXN.arg0, arg1: 4096, data: "device::\0".data(using: .utf8) ?? Data())
+            try? send(packet: response, fd: fd)
+            return true
+        case .signatureOnly:
+            return performAuthExchange(fd: fd, initialCNXN: initialCNXN, requirePublicKey: false)
+        case .signatureThenPublicKey:
+            return performAuthExchange(fd: fd, initialCNXN: initialCNXN, requirePublicKey: true)
+        }
+    }
+
+    private func performAuthExchange(fd: Int32, initialCNXN: ADBPacket, requirePublicKey: Bool) -> Bool {
+        let token = Data("token".utf8)
+        do {
+            let authPacket = ADBPacket(command: ADBCommand.auth, arg0: ADBAuth.token, arg1: 0, data: token)
+            try send(packet: authPacket, fd: fd)
+            guard let signaturePacket = try? readPacket(fd: fd), signaturePacket.command == ADBCommand.auth else { return false }
+            recordAuth(type: signaturePacket.arg0)
+            guard signaturePacket.arg0 == ADBAuth.signature else { return false }
+
+            if requirePublicKey {
+                let secondToken = ADBPacket(command: ADBCommand.auth, arg0: ADBAuth.token, arg1: 0, data: token)
+                try send(packet: secondToken, fd: fd)
+                guard let keyPacket = try? readPacket(fd: fd), keyPacket.command == ADBCommand.auth else { return false }
+                recordAuth(type: keyPacket.arg0)
+                guard keyPacket.arg0 == ADBAuth.publicKey else { return false }
+            }
+
+            let response = ADBPacket(command: ADBCommand.cnxn, arg0: initialCNXN.arg0, arg1: 4096, data: "device::\0".data(using: .utf8) ?? Data())
+            try send(packet: response, fd: fd)
+            return true
+        } catch {
+            return false
         }
     }
 

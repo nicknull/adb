@@ -68,6 +68,12 @@ enum ADBCommand {
     static let write: UInt32 = "WRTE".adbCommand
 }
 
+enum ADBAuth {
+    static let token: UInt32 = 1
+    static let signature: UInt32 = 2
+    static let publicKey: UInt32 = 3
+}
+
 private extension String {
     var adbCommand: UInt32 {
         var value: UInt32 = 0

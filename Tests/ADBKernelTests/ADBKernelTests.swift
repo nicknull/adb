@@ -29,4 +29,37 @@ final class ADBKernelTests: XCTestCase {
         try kernel.sendKeyEvent(24)
         wait(for: [expectation], timeout: 1.0)
     }
+
+    func testConnectionRequiresAuthenticatorWhenAuthRequested() throws {
+        let server = MockADBServer(authenticationMode: .signatureOnly) { _ in Data() }
+        let port = try server.start()
+        defer { server.stop() }
+
+        let kernel = ADBKernel(host: "127.0.0.1", port: port)
+        XCTAssertThrowsError(try kernel.connect())
+    }
+
+    func testAuthenticatorSendsSignatureThenPublicKey() throws {
+        let server = MockADBServer(authenticationMode: .signatureThenPublicKey) { _ in Data() }
+        let port = try server.start()
+        defer { server.stop() }
+
+        struct StubAuthenticator: ADBAuthenticator {
+            func sign(authToken: Data) throws -> Data {
+                return Data(repeating: 0xAB, count: authToken.count)
+            }
+
+            var publicKey: Data {
+                var data = Data("stub-key".utf8)
+                data.append(0)
+                return data
+            }
+        }
+
+        let configuration = ADBKernel.Configuration(host: "127.0.0.1", port: port, authenticator: StubAuthenticator())
+        let kernel = ADBKernel(configuration: configuration)
+        try kernel.connect()
+
+        XCTAssertEqual(server.observedAuthTypes(), [ADBAuth.signature, ADBAuth.publicKey])
+    }
 }

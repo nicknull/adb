@@ -6,7 +6,10 @@ public final class RSAPEMAuthenticator: ADBAuthenticator {
     private let privateKey: SecKey
     public let publicKey: Data
 
-    public init(pemPrivateKey: String) throws {
+    /// - Parameters:
+    ///   - pemPrivateKey: Contents of the `adbkey` private key in PEM format.
+    ///   - adbPublicKey: The exact text contained in the matching `adbkey.pub` file (base64 plus the comment).
+    public init(pemPrivateKey: String, adbPublicKey: String) throws {
         let cleaned = RSAPEMAuthenticator.stripHeaders(from: pemPrivateKey)
         guard let keyData = Data(base64Encoded: cleaned) else {
             throw NSError(domain: "ADBKernel", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid PEM contents"])
@@ -23,12 +26,7 @@ public final class RSAPEMAuthenticator: ADBAuthenticator {
             throw error?.takeRetainedValue() ?? NSError(domain: "ADBKernel", code: -2, userInfo: nil)
         }
         self.privateKey = privateKey
-
-        guard let pubKey = SecKeyCopyPublicKey(privateKey),
-              let pubData = SecKeyCopyExternalRepresentation(pubKey, &error) as Data? else {
-            throw error?.takeRetainedValue() ?? NSError(domain: "ADBKernel", code: -3, userInfo: nil)
-        }
-        self.publicKey = pubData
+        self.publicKey = RSAPEMAuthenticator.preparePublicKeyPayload(from: adbPublicKey)
     }
 
     public func sign(authToken: Data) throws -> Data {
@@ -47,6 +45,15 @@ public final class RSAPEMAuthenticator: ADBAuthenticator {
             .replacingOccurrences(of: "-----END RSA PRIVATE KEY-----", with: "")
             .components(separatedBy: .whitespacesAndNewlines)
             .joined()
+    }
+
+    private static func preparePublicKeyPayload(from adbPublicKey: String) -> Data {
+        let trimmed = adbPublicKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        var buffer = Data(trimmed.utf8)
+        if buffer.last != 0 {
+            buffer.append(0)
+        }
+        return buffer
     }
 }
 #endif

@@ -29,10 +29,16 @@ If your Android TV is secured (default on modern builds), provide an authenticat
 ```swift
 #if canImport(Security)
 let pem = try String(contentsOf: Bundle.main.url(forResource: "adb_private", withExtension: "pem")!)
-let authenticator = try RSAPEMAuthenticator(pemPrivateKey: pem)
+let publicKey = try String(contentsOf: Bundle.main.url(forResource: "adbkey", withExtension: "pub")!)
+let authenticator = try RSAPEMAuthenticator(pemPrivateKey: pem, adbPublicKey: publicKey)
 let kernel = ADBKernel(host: "192.168.1.120", authenticator: authenticator)
 #endif
 ```
+
+The authenticator sends the same RSA assets that the classic `adb` client generates (`adbkey` and `adbkey.pub`). The device
+first issues an `AUTH` token, which must be signed with your private key. If the key has not yet been authorized on that
+device, it will ask for the public key payload contained inside `adbkey.pub` so the user can accept the fingerprint prompt on
+the TV.
 
 ## iOS Deployment Notes
 

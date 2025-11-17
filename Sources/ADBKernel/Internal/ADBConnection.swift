@@ -39,23 +39,27 @@ final class ADBConnection {
             data: configuration.banner.data(using: .utf8) ?? Data()
         ))
 
+        var sentSignature = false
+        var sentPublicKey = false
+
         while true {
             let packet = try readPacket()
             switch packet.command {
             case ADBCommand.cnxn:
                 remoteMaxPayload = packet.arg1
                 return
-            case ADBCommand.auth:
+            case ADBCommand.auth where packet.arg0 == ADBAuth.token:
                 guard let authenticator = configuration.authenticator else {
                     throw ConnectionError.authenticationRequired
                 }
-                switch packet.arg0 {
-                case 1: // token
+                if !sentSignature {
                     let signature = try authenticator.sign(authToken: packet.data)
-                    try send(packet: ADBPacket(command: ADBCommand.auth, arg0: 2, arg1: 0, data: signature))
-                case 2: // signature rejected, send public key
-                    try send(packet: ADBPacket(command: ADBCommand.auth, arg0: 3, arg1: 0, data: authenticator.publicKey))
-                default:
+                    try send(packet: ADBPacket(command: ADBCommand.auth, arg0: ADBAuth.signature, arg1: 0, data: signature))
+                    sentSignature = true
+                } else if !sentPublicKey {
+                    try send(packet: ADBPacket(command: ADBCommand.auth, arg0: ADBAuth.publicKey, arg1: 0, data: authenticator.publicKey))
+                    sentPublicKey = true
+                } else {
                     throw ConnectionError.handshakeFailed
                 }
             default:
