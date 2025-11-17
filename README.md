@@ -1,65 +1,49 @@
 # ADBKernel
 
-A lightweight Swift Package that exposes a small "ADB kernel" which you can embed inside a SwiftUI app to talk to Android TV devices. The kernel relies on the Android Debug Bridge (ADB) binary that is distributed with the Android SDK and shells out to it using `Process`.
+ADBKernel is a pure Swift implementation of the Android Debug Bridge (ADB) transport protocol. It opens a TCP connection
+straight to the Android device (e.g. Android TV) and speaks the binary `adbd` protocol so you can send shell commands,
+key events, and capture screenshots directly from SwiftUI applications running on iOS or macOS—no bundled `adb` binary is
+required.
 
 ## Features
 
-- Automatically resolves the `adb` binary with `which` or accepts a custom path
-- Handles `adb start-server`, `connect`, `disconnect`, `shell`, `install`, `pull`, and basic key events
-- Throws strongly typed `KernelError` values you can surface in your UI
-- Designed to be run from a SwiftUI app (macOS/iOS) that needs to automate an Android TV over TCP/IP
+- Implements the ADB connection handshake (`CNXN`, `AUTH`, `OPEN`, `WRTE`, `CLSE`) entirely in Swift
+- Works from iOS 15+/macOS 13+ without spawning subprocesses
+- Provides a pluggable `ADBAuthenticator` so you can sign authentication tokens with your RSA keypair
+- Exposes convenience helpers for running shell commands, dispatching key events, and triggering `screencap`
 
 ## Usage
-
-Add the package to your `Package.swift` dependencies and import `ADBKernel`.
 
 ```swift
 import ADBKernel
 
-let kernel = try ADBKernel(deviceID: "192.168.1.43:5555")
-try kernel.startServer()
-try kernel.connect("192.168.1.43:5555")
+let kernel = ADBKernel(host: "192.168.1.120", port: 5555)
+try kernel.connect()
 try kernel.sendKeyEvent(26) // Power toggle
+let screenshotData = try kernel.screenshot()
 ```
 
-You can embed the commands inside a SwiftUI `ObservableObject` to update the UI when an action succeeds or fails.
+If your Android TV is secured (default on modern builds), provide an authenticator that can sign the token presented by
+`adbd`:
 
 ```swift
-@MainActor
-final class AndroidRemoteViewModel: ObservableObject {
-    private let kernel = try? ADBKernel(deviceID: "192.168.1.43:5555")
-
-    func volumeUp() {
-        Task {
-            do {
-                try kernel?.sendKeyEvent(24)
-            } catch {
-                // Update published error state
-            }
-        }
-    }
-}
+#if canImport(Security)
+let pem = try String(contentsOf: Bundle.main.url(forResource: "adb_private", withExtension: "pem")!)
+let authenticator = try RSAPEMAuthenticator(pemPrivateKey: pem)
+let kernel = ADBKernel(host: "192.168.1.120", authenticator: authenticator)
+#endif
 ```
 
-## Running on iOS
+## iOS Deployment Notes
 
-The package now declares iOS 15.0+ as a supported platform so it can be consumed by a SwiftUI application that targets iPhone
-or iPad hardware. Because iOS apps cannot rely on the host environment having `adb` installed, bundle a copy of the `adb`
-binary inside your application (for internal/test builds) and resolve it with `Bundle.main.url(forResource:withExtension:)`
-when creating the kernel:
-
-```swift
-let adbURL = Bundle.main.url(forResource: "adb", withExtension: nil)!
-let kernel = try ADBKernel(adbPath: adbURL.path, deviceID: "192.168.1.43:5555")
-```
-
-> **Note:** Executing bundled binaries is only permitted for internal enterprise/test deployments. Apps submitted to the App
-Store will be rejected if they launch helper executables, so prefer Mac Catalyst or macOS targets when distributing to the
-public.
+Because ADBKernel talks directly to the device, no helper executables are spawned. Your SwiftUI application simply opens a
+TCP socket, performs the handshake, and issues commands. You still need to ship an RSA keypair that the device trusts. The
+first time you connect, Android will display the RSA fingerprint and prompt you to authorize the key. Once accepted, future
+connections succeed silently.
 
 ## Tests
 
-The package ships with unit tests that stub the `adb` binary, proving that command arguments (device selection, key events, etc.) are wired correctly. Run them with:
+Run the included test suite, which spins up a lightweight Swift mock of the ADB daemon, with:
 
 ```bash
 swift test
